@@ -1,0 +1,506 @@
+# Importing packages
+import datetime as dt
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import numpy as np
+import psycopg2
+import pandas as pd
+import random
+import seaborn as sns
+import statsmodels.formula.api as smf
+from IPython.display import Image
+
+# Connecting to covid19db.org
+conn = psycopg2.connect(
+    host='covid19db.org',
+    port=5432,
+    dbname='covid19',
+    user='covid19',
+    password='covid19')
+cur = conn.cursor()
+
+#Functions
+
+def cases_by_govresp(govresp,data):
+    '''The mean total confirmed cases per million at specified government response index'''
+
+    return data[abs(data["gov_resp"]-govresp)<1]["total confirmed/million"].mean()
+    
+def random_low_high_countries(data):
+    '''Returns six random countries; three with lower initial responses and three with higher. 
+        These countries are more than half a standard deviation away from the mean'''
+
+    i_response= data["initial_response"]
+    low= i_response.mean()-(i_response.std()/2)
+    high= i_response.mean()+(i_response.std()/2)
+       
+    low_countries= list(data[data["initial_response"]<low].country.unique())
+    high_countries= list(data[data["initial_response"]>high].country.unique())
+
+    random_lowitems = random.sample(low_countries, 3)
+    random_highitems = random.sample(high_countries, 3)
+    
+    low_high= random_lowitems + random_highitems
+    
+    return low_high
+    
+    
+ # Collecting country-level data
+sql_command = """SELECT date,country,countrycode,confirmed,dead FROM epidemiology WHERE 
+               adm_area_1 IS NULL AND
+               adm_area_2 IS NULL AND
+               adm_area_3 IS NULL AND 
+               source= 'WRD_WHO'        
+               ORDER BY 
+                   date"""
+
+df_epidemiology = pd.read_sql(sql_command, conn)
+df_epidemiology["date"]=pd.to_datetime(df_epidemiology['date'], format='%Y-%m-%d')
+df_epidemiology["confirmed"]=df_epidemiology["confirmed"].astype(int)
+df_epidemiology["dead"]=df_epidemiology["dead"].astype(int)
+
+# Creating a new column for daily confirmed cases 
+for country in df_epidemiology.country.unique():
+    mask = df_epidemiology["country"]==country
+    df_epidemiology.loc[mask,"confirmed/day"] = df_epidemiology[mask]['confirmed'].diff()
+    df_epidemiology.loc[mask,"dead/day"] = df_epidemiology[mask]['dead'].diff()
+df_epidemiology['confirmed/day'].fillna(0,inplace=True)
+df_epidemiology['dead/day'].fillna(0,inplace=True)
+
+
+sql_command = """SELECT value, country, countrycode FROM world_bank WHERE  
+                   indicator_name = 'Population, total' AND 
+                   year=2019"""
+
+df_pop = pd.read_sql(sql_command, conn) 
+df_pop.rename(columns={"value": "population"},inplace=True)
+df_pop["population(m)"]=df_pop["population"]/1000000
+
+# Merging with epidemiology data
+df_epi=pd.merge(df_epidemiology,df_pop,on=["country","countrycode"], how='left')
+
+# Exluding countries without population data
+df_epi.dropna(inplace=True)
+
+# Creating new columns for epidemiology data normalized by population
+df_epi["confirmed/million"]= df_epi["confirmed/day"]/df_epi["population(m)"]
+df_epi["dead/million"]= df_epi["dead/day"]/df_epi["population(m)"]
+df_epi["total confirmed/million"]= df_epi["confirmed"]/df_epi["population(m)"]
+df_epi["total dead/million"]= df_epi["dead"]/df_epi["population(m)"]
+
+
+sql_command ="""SELECT date, country, countrycode, government_response_index_for_display
+               FROM government_response 
+               WHERE adm_area_1 IS NULL
+               ORDER BY date """
+    
+df_govtrack= pd.read_sql(sql_command, conn) 
+df_govtrack.rename(columns={"government_response_index_for_display": "gov_resp"},inplace=True)
+df_govtrack["date"]=pd.to_datetime(df_govtrack['date'], format='%Y-%m-%d')
+df_govtrack.dropna(inplace=True)
+
+#Merge with epidemiology data
+gov_epi = pd.merge(df_govtrack, df_epi, on=['country','countrycode','date'])#, right_on = ['country','countrycode','date'])
+
+
+# E037: The question on Government Responsibility
+questions=["E037"]
+wave = "2008-2010"
+
+sql_command = """SELECT * FROM surveys WHERE wave=%(wave)s AND adm_area_1 IS NULL AND adm_area_2 IS NULL AND adm_area_3 IS NULL"""
+df_surveys = pd.read_sql(sql_command, conn, params={'wave': wave})
+
+# Cleaning Data 
+survey= pd.DataFrame()
+survey["country"]=np.zeros(len(df_surveys))
+survey["countrycode"]=np.zeros(len(df_surveys))
+
+for i in range(len(df_surveys)):
+    survey["country"].loc[i]=df_surveys["country"].loc[i]
+    survey["countrycode"].loc[i]=df_surveys["countrycode"].loc[i]
+    for j in questions:
+        title= df_surveys.properties[i][j]["Label"]
+        liste=[]
+        for k,v in df_surveys.properties[i][j]["Frequencies"].items():
+            if k[-2]!="-":
+                varie= int(k[-2:].replace("_",""))*v 
+                liste.append(varie)
+                survey.loc[i,title]=sum(liste)
+                
+                
+# Initial responses for the first hundred cases
+aggr= {"gov_resp":[np.ptp,min,max], "date":np.ptp, "confirmed":np.ptp}
+
+initial=gov_epi[(gov_epi["confirmed"]>0.1)&(gov_epi["confirmed"]<100)].groupby("country").agg(aggr)
+initial.reset_index(inplace=True)
+initial["daily case rate"]=initial["confirmed"]["ptp"]/initial["date"]["ptp"].dt.days
+initial["initial_response"]=(initial["gov_resp"]["min"]+1)*(initial["gov_resp"]["ptp"]+1)/(initial["daily case rate"]+1)
+
+
+# Merging the responses with survey data 
+response_data= initial[["country","initial_response"]].droplevel(1,axis=1)
+all_df= pd.merge(survey,response_data,on="country")
+all_df.rename(columns={"Government responsibility":"Government_responsibility"},inplace=True)
+
+
+# Regression model for initial responses and government responsibility 
+form_1 = 'initial_response ~ Government_responsibility'
+fit_1 = smf.ols(formula = form_1, data = all_df).fit()
+
+
+# Daily Confirmed Cases per Million
+def figure_1():
+    subset= ['Luxembourg', 'Estonia', 'Belarus','Italy','Romania','Russia', 'Turkey', 'Portugal']
+    color_list = ["r","b","g","c","m","y","tab:orange","tab:purple"]
+    epi=df_epi.groupby('country').resample('W-MON', on='date').mean().reset_index().sort_values(by='date')
+    i=0
+    plt.figure(figsize=(10,10))  
+    for country in subset:
+        mask= epi["country"]==country
+        plt.plot(epi[mask]["date"],epi[mask]['confirmed/million'],linestyle='-', color=color_list[i])
+        plt.legend(subset)
+        i+=1
+    plt.ylabel("Daily confirmed cases per million")
+    plt.title("Figure 1: Daily Confirmed Cases per Million",fontsize=25)
+    plt.savefig("Figure_1.png")
+    plt.show()
+    
+ # Daily Confirmed Cases per Million
+def figure_1():
+    subset= ['Luxembourg', 'Estonia', 'Belarus','Italy','Romania','Russia', 'Turkey', 'Portugal']
+    color_list = ["r","b","g","c","m","y","tab:orange","tab:purple"]
+    epi=df_epi.groupby('country').resample('W-MON', on='date').mean().reset_index().sort_values(by='date')
+    i=0
+    plt.figure(figsize=(10,10))  
+    for country in subset:
+        mask= epi["country"]==country
+        plt.plot(epi[mask]["date"],epi[mask]['confirmed/million'],linestyle='-', color=color_list[i])
+        plt.legend(subset)
+        i+=1
+    plt.ylabel("Daily confirmed cases per million")
+    plt.title("Figure 1: Daily Confirmed Cases per Million",fontsize=25)
+    plt.savefig("Figure_1.png")
+    plt.show()
+ 
+ # Initial Responses of Several Countries
+def figure_2():
+    countries= random_low_high_countries(initial)
+    
+    fig, axs = plt.subplots(2, 3,figsize=(15,15),sharey=True)
+    fig.suptitle('Figure 2: Initial Responses of Several Countries', fontsize=25)
+    fig.subplots_adjust(wspace=0.23,hspace=0.3)
+    rows = ['Lower initial response score','Higher initial response score']
+    for ax, row in zip(axs[:,0], rows):
+        ax.set_ylabel(row, rotation=90, fontsize=25,color='xkcd:dark maroon')
+    for ax in axs[0,:]:
+        ax.set_facecolor('xkcd:ice blue')
+    for ax in axs[1,:]:
+        ax.set_facecolor('xkcd:pale lilac')
+    
+    filtered_data=gov_epi[(gov_epi["confirmed"]<100)].sort_values("date")
+    for idx, country in enumerate(countries):
+        data = filtered_data[filtered_data['country'] == country]
+        date = data['date']
+        total_confirmed = data['confirmed']
+        gov_response = data['gov_resp']
+        argmin = total_confirmed.ne(0).idxmax()
+        axs[idx // 3, idx % 3].plot(date, total_confirmed, label="Total Confirmed", color="xkcd:prussian blue")
+        
+        first_case = (date[argmin], int(total_confirmed[argmin]))
+        axs[idx // 3, idx % 3].plot([first_case[0]], [first_case[1]], marker="*", ls="", c="green", markersize=10)
+        axs[idx // 3, idx % 3].annotate("First case", (first_case[0]-dt.timedelta(days=5), first_case[1]-6),color="green")
+        
+        axis = axs[idx // 3, idx % 3].twinx()
+        axis.set_ylim([-3,70])
+        axis.plot(date, gov_response, label="Gov Resp", color="xkcd:dirty orange")
+        axis.tick_params(axis='y', labelcolor="xkcd:dirty orange")
+        
+        lines, labels = axs[idx // 3, idx % 3].get_legend_handles_labels()
+        lines2, labels2 = axis.get_legend_handles_labels()
+        axis.legend(lines + lines2, labels + labels2, loc='upper right')
+    
+        axs[idx // 3, idx % 3].set_title(country.upper(),fontsize=15,color="xkcd:dark maroon")
+        axs[idx // 3, idx % 3].tick_params(axis='y', labelcolor="xkcd:prussian blue")
+        axs[idx // 3, idx % 3].tick_params(labelrotation=35)
+        axs[idx // 3, idx % 3].yaxis.set_tick_params(which='both', labelbottom=True)
+    
+    plt.savefig("Figure 2.png")
+    plt.show()
+    
+ 
+ # Regression model for initial response and government responsibility
+def figure_3():
+    g = sns.lmplot(x="Government_responsibility", y="initial_response", data=all_df)
+    g.fig.suptitle("Figure 3: Regression Model for Government Responsibility and Initial Responses by Country",
+                      fontsize=15, fontdict={"weight": "bold"})
+    
+    g.set(xlabel='Government Responsibility', ylabel='Initial Response')
+    plt.savefig("Figure 3.png",bbox_inches='tight')
+    plt.show()
+    
+ 
+ # Responses at the date of the first positive cases 
+non_zero= gov_epi[gov_epi["confirmed"]!= 0]
+i = non_zero.groupby("country")["confirmed"].idxmin()
+first_case=non_zero.loc[i]
+
+table_1 = pd.DataFrame([],columns=["Mean","Std Dev.","Min.","Max."],
+                           index=["Government Response"])
+
+table_1.loc["Government Response"]= [first_case["gov_resp"].mean(),first_case["gov_resp"].std(),first_case["gov_resp"].min(),
+                      first_case["gov_resp"].max()]
+
+
+
+# World Values Survey "Government Responsibility" answers 
+table_2 = pd.DataFrame([],columns=["Mean","Std Dev.","Min.","Max."],
+                           index=["Government Responsibility"])
+
+table_2.loc["Government Responsibility"]= [survey["Government responsibility"].mean(),survey["Government responsibility"].std(),
+                                           survey["Government responsibility"].min(),survey["Government responsibility"].max()]
+
+
+# Countries with minimum and maximum values 
+minim = survey["Government responsibility"].idxmin()
+maxim = survey["Government responsibility"].idxmax()
+
+min_country=survey.loc[minim,"country"]
+max_country=survey.loc[maxim,"country"]
+
+
+
+# Important Parameters for the Regression Model for initial response and government responsibility
+table_3 = pd.DataFrame([],columns=["R squared","Coefficient for Gov. Resp.","p-value for Gov. Resp."],
+                           index=["Regression Model"])
+
+table_3.loc["Regression Model"]= [fit_1.rsquared,fit_1.params[1],fit_1.pvalues[1]]
+
+
+#Code for Part 2
+
+# Importing packages
+import apikeys
+import requests
+import bs4
+import time
+from scipy import stats
+
+# Head of States
+DOMAIN = "https://en.wikipedia.org" 
+
+s = requests.Session()
+s.headers.update({'User-agent': 'Python/Elmira wikicrawl0.2'})
+
+article = "List_of_current_heads_of_state_and_government"
+req = s.get(f"{DOMAIN}/wiki/{article}") 
+soup = bs4.BeautifulSoup(req.content, 'html.parser')
+indiatable=soup.find('table',{'wikitable plainrowheaders'})
+pre=pd.read_html(str(indiatable))
+pre=pd.DataFrame(pre[0])
+
+# Only the countries with World Values Survey data
+for i in range(len(pre)):
+    if pre.loc[i,"State"] not in survey["country"].unique():
+        pre.drop([i],inplace=True)
+
+pre.reset_index(inplace=True,drop=True)
+pre.drop(columns="Head of government",inplace=True)
+
+# Drop repetative rows
+pre.drop([5,6,8,12,19,43,44,46],inplace=True)
+pre.reset_index(inplace=True,drop=True)
+
+
+twitter_accounts= np.array(['ilirmetazyrtar','Arm_President','vanderbellen', 0,0,0,'PresidentOfBg',0,
+                'AnastasiadesCY',0,0,'AlarKaris','niinisto','EmmanuelMacron',0,
+                0,0,0,'PresidentISL','PresidentIRL','Quirinale','valstsgriba','GitanasNauseda',0,'presidentmt',
+                'sandumaiamd','predsjednik_cg',0,0,'AndrzejDuda','presidencia','KlausIohannis','KremlinRussia_E',
+                'avucic','ZuzanaCaputova','BorutPahor',0, 0,'ParmelinG','RTErdogan','ZelenskyyUa',0])
+                
+
+# Presidents' twitter usernames as new column
+pre["accounts"]=twitter_accounts
+pre.reset_index(inplace=True, drop=True)
+
+# Merging with World Values survey data
+pres=pd.merge(pre,survey,left_on="State",right_on="country")
+
+# Drop monarchs
+pres.drop([4,10,23,27,28,36,37,41],inplace=True)
+pres.reset_index(inplace=True)
+
+# New Column for categorizing those with active accounts and those without
+for i in range(len(pres)):
+    if pres.loc[i,"accounts"]=="0":
+        pres.loc[i,"Active Twitter Account"]= "No"
+    else:
+        pres.loc[i,"Active Twitter Account"]="Yes"
+        
+        
+# Selecting those with active Twitter accounts
+actives= pre.copy()
+for i in range(len(actives)):
+    if '0' in actives.loc[i,"accounts"]:
+        actives.drop([i],inplace=True)
+actives.reset_index(inplace=True,drop=True)
+
+
+
+# Retrieving id numbers and number of followers with usernames
+ids=pd.DataFrame()
+headers = {"Authorization": "Bearer {}".format(apikeys.BEARER_TOKEN)}
+for account in actives["accounts"].unique():
+    url = f"https://api.twitter.com/2/users/by?usernames={account}&tweet.fields=author_id&user.fields=public_metrics"
+    response = requests.request("GET", url, headers=headers)
+    tweets = response.json()
+    tweets=pd.json_normalize(tweets["data"])
+    ids=ids.append(tweets)
+    ids.reset_index(drop=True, inplace=True)
+    time.sleep(2)
+
+ids.rename(columns={"public_metrics.followers_count":"followers"},inplace=True)
+ids=ids[["id","username","followers"]]
+
+# Merge for the country names
+ids_pre=pd.merge(ids,pre,how="left",left_on="username",right_on="accounts")
+
+
+# Retrieving last 100 mentions with id numbers
+tweets_all=pd.DataFrame()
+n = datetime.datetime.now(dt.timezone.utc)
+end_time = n.isoformat()
+
+headers = {"Authorization": "Bearer {}".format(apikeys.BEARER_TOKEN)}
+for i in ids["id"].unique():
+    url=f"https://api.twitter.com/2/users/{i}/mentions"
+    params={
+        "end_time":end_time,
+        "max_results":100,
+        "tweet.fields":"created_at,lang,public_metrics,text",
+        "expansions":"author_id",
+        "user.fields":"created_at,description,entities,id,name,public_metrics,username"}
+    response = requests.request("GET", url, headers=headers,params=params)
+    tweets = response.json()
+    tweet=pd.json_normalize(tweets["data"])
+    tweet["users"]=i
+    tweets_all=tweets_all.append(tweet)
+    tweets_all.reset_index(drop=True, inplace=True) 
+    
+    
+# Merging and sorting
+tweets_df=pd.merge(tweets_all,ids, right_on=["id","username"],left_on=["users","username"])
+tweets_df['created_at']=pd.to_datetime(tweets_df['created_at'])
+tweets_df=tweets_df.sort_values(by=['created_at'])
+
+
+# Calculating the frequency of mentions
+means= tweets_df.groupby('username')['created_at'].apply(lambda x: x.diff().mean())
+means=means.to_frame()
+means.reset_index(inplace=True)
+for i in range(len(means)):
+    means.loc[i,"seconds"]= means.loc[i,"created_at"].total_seconds()
+    
+# Merge to collect all information together
+mean=pd.merge(means,ids_pre[["username","State","followers"]],how="left",left_on="username",right_on="username")
+mean.rename(columns={"State":"country"},inplace=True)
+
+
+# Merge with population data
+mean_pop=pd.merge(mean,df_pop, on="country")
+
+
+# Analysis
+# Calculate mention score
+mean["mention_score"]=1/(mean["followers"]*mean["seconds"])
+
+# Merge with World Values Survey data
+mean_survey=pd.merge(mean,survey,on="country")
+
+# Transforming to log-scale
+mean_survey["ln_mention"]=np.log(mean_survey["mention_score"])
+
+# Regression model for mention score and government responsibility
+mean_survey.rename(columns={"Government responsibility":"Government_responsibility"},inplace=True)
+
+form_3 = 'ln_mention ~ Government_responsibility'
+fit_3 = smf.ols(formula = form_3, data = mean_survey).fit()
+
+#Figures
+# Regression model with log-log scale
+def figure_4():
+    mean_pop["ln_pop"]=np.log(mean_pop["population(m)"])
+    mean_pop["ln_seconds"]=np.log(mean_pop["seconds"])     
+    
+    g = sns.lmplot(x="ln_pop", y="ln_seconds", data=mean_pop)
+    g.fig.suptitle("Figure 4: Regression Model for Frequency of Mentions and Population in millions",
+                      fontsize=15, fontdict={"weight": "bold"})
+    
+    g.set(xlabel='Log(Population(m))', ylabel='Log(Average seconds between consecutive mentions)')
+    plt.savefig("Figure 4.png",bbox_inches='tight')
+    plt.show()
+ 
+# Violin plot for presidents with an active Twitter account and those without one
+def figure_5():
+    g = sns.violinplot(y=pres["Government responsibility"],x=pres["Active Twitter Account"]) 
+    g.set_title("Figure 5: Differences of Having an Active Twitter Account",
+                      fontsize=15, fontdict={"weight": "bold"})
+    
+    g.set(xlabel='Active Twitter Account', ylabel='Government responsibility')
+    plt.savefig("Figure 5.png",bbox_inches='tight')
+    plt.show()
+    
+
+# Regression model for mention score and government responsibility
+def figure_6():
+    g = g = sns.lmplot(x="Government_responsibility",y="ln_mention",data=mean_survey)
+    g.fig.suptitle("Figure 6: Regression Model for Government Responsibility and Mention Scores by Country",
+                      fontsize=15, fontdict={"weight": "bold"})
+    
+    g.set(xlabel='Government Responsibility', ylabel='Log(Mention Score)')
+    plt.savefig("Figure 6.png",bbox_inches='tight')
+    plt.show()
+    
+# Tables
+# Summary statistics for frequency and followers
+table_4 = pd.DataFrame([],columns=["Mean","Std Dev.","Min.","Max."],index=["Seconds","Followers"])
+
+table_4.loc["Seconds"]= [mean["seconds"].mean(),mean["seconds"].std(),mean["seconds"].min(),mean["seconds"].max()]
+
+table_4.loc["Followers"]= [mean["followers"].mean(),mean["followers"].std(),mean["followers"].min(),mean["followers"].max()]
+
+# Countries with minimum and maximum values 
+min_fo = mean["followers"].idxmin()
+min_freq = mean["seconds"].idxmax()
+
+min_followers=mean.loc[min_fo,"country"]
+min_freq=mean.loc[min_freq,"country"]
+
+# Important parameters for the Regression Model of seconds and population
+form_2 = 'ln_seconds ~ ln_pop'
+fit_2 = smf.ols(formula = form_2, data = mean_pop).fit()
+
+table_5 = pd.DataFrame([],columns=["R squared","Coefficient"],
+                           index=["Regression Model"])
+
+table_5.loc["Regression Model"]= [fit_2.rsquared,fit_2.params[1]]
+
+# T-test for comparing the differences of having an active Twitter account or not
+test=stats.ttest_ind(pres["Government responsibility"][pres["Active Twitter Account"]=="Yes"], 
+                pres["Government responsibility"][pres["Active Twitter Account"]=="No"])
+p_value=test[1]
+
+# Important Parameters for the Regression Model for mention score and government responsibility
+table_7 = pd.DataFrame([],columns=["R squared","Coefficient for Gov. Resp.","p-value for Gov. Resp."],
+                           index=["Regression Model"])
+
+table_7.loc["Regression Model"]= [fit_3.rsquared,fit_3.params[1],fit_3.pvalues[1]]
+
+
+
+
+
+
+
+
+
+
